@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { createCanvas, loadImage } from 'canvas';
+import sharp from 'sharp';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -15,7 +15,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     service: 'TCG-Forensics CV Backend',
     version: '1.0.0',
-    algorithms: 20
+    algorithms: 8
   });
 });
 
@@ -24,27 +24,29 @@ app.get('/health', (req, res) => {
 // ============================================================================
 
 /**
- * Load base64 image to Canvas ImageData
+ * Load base64 image and get raw pixel data using Sharp
  */
-async function loadImageToCanvas(base64String) {
+async function loadImageData(base64String) {
   try {
     // Remove data:image/xxx;base64, prefix if present
     const base64Data = base64String.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
     
-    const img = await loadImage(buffer);
-    const canvas = createCanvas(img.width, img.height);
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0);
+    // Use sharp to get raw pixel data
+    const image = sharp(buffer);
+    const metadata = await image.metadata();
     
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // Get raw RGBA pixels
+    const { data, info } = await image
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
     
     return { 
-      imageData, 
-      width: canvas.width, 
-      height: canvas.height,
-      canvas,
-      ctx
+      data: new Uint8ClampedArray(data),
+      width: info.width, 
+      height: info.height,
+      channels: info.channels
     };
   } catch (error) {
     console.error('[CV Backend] Error loading image:', error);
@@ -55,18 +57,19 @@ async function loadImageToCanvas(base64String) {
 /**
  * Convert RGB to Grayscale
  */
-function rgbToGrayscale(imageData) {
-  const data = imageData.data;
-  const gray = new Uint8ClampedArray(imageData.width * imageData.height);
+function rgbToGrayscale(imageData, width, height) {
+  const data = imageData;
+  const gray = new Uint8ClampedArray(width * height);
   
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    gray[i / 4] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+  for (let i = 0; i < width * height; i++) {
+    const idx = i * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
   }
   
-  return { data: gray, width: imageData.width, height: imageData.height };
+  return gray;
 }
 
 // ============================================================================
@@ -76,18 +79,20 @@ function rgbToGrayscale(imageData) {
 /**
  * 1. CANNY EDGE DETECTION
  */
-async function cannyEdgeDetection(base64Image, lowThreshold = 50, highThreshold = 150) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+async function cannyEdgeDetection(base64Image) {
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
+  
+  const lowThreshold = 50;
+  const highThreshold = 150;
   
   // Sobel operators
   const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
   const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
   
   const gradient = new Float32Array(width * height);
-  const direction = new Float32Array(width * height);
   
-  // Calculate gradient magnitude and direction
+  // Calculate gradient magnitude
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       let gx = 0, gy = 0;
@@ -96,58 +101,19 @@ async function cannyEdgeDetection(base64Image, lowThreshold = 50, highThreshold 
         for (let kx = -1; kx <= 1; kx++) {
           const idx = (y + ky) * width + (x + kx);
           const ki = (ky + 1) * 3 + (kx + 1);
-          gx += gray.data[idx] * sobelX[ki];
-          gy += gray.data[idx] * sobelY[ki];
+          gx += gray[idx] * sobelX[ki];
+          gy += gray[idx] * sobelY[ki];
         }
       }
       
-      const idx = y * width + x;
-      gradient[idx] = Math.sqrt(gx * gx + gy * gy);
-      direction[idx] = Math.atan2(gy, gx);
+      gradient[y * width + x] = Math.sqrt(gx * gx + gy * gy);
     }
   }
   
-  // Non-maximum suppression
-  const nms = new Uint8ClampedArray(width * height);
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const idx = y * width + x;
-      const angle = direction[idx];
-      const mag = gradient[idx];
-      
-      let neighbor1 = 0, neighbor2 = 0;
-      
-      if ((angle >= -Math.PI/8 && angle < Math.PI/8) || (angle >= 7*Math.PI/8) || (angle < -7*Math.PI/8)) {
-        neighbor1 = gradient[y * width + (x - 1)];
-        neighbor2 = gradient[y * width + (x + 1)];
-      } else if ((angle >= Math.PI/8 && angle < 3*Math.PI/8) || (angle >= -7*Math.PI/8 && angle < -5*Math.PI/8)) {
-        neighbor1 = gradient[(y - 1) * width + (x + 1)];
-        neighbor2 = gradient[(y + 1) * width + (x - 1)];
-      } else if ((angle >= 3*Math.PI/8 && angle < 5*Math.PI/8) || (angle >= -5*Math.PI/8 && angle < -3*Math.PI/8)) {
-        neighbor1 = gradient[(y - 1) * width + x];
-        neighbor2 = gradient[(y + 1) * width + x];
-      } else {
-        neighbor1 = gradient[(y - 1) * width + (x - 1)];
-        neighbor2 = gradient[(y + 1) * width + (x + 1)];
-      }
-      
-      if (mag >= neighbor1 && mag >= neighbor2) {
-        nms[idx] = mag;
-      }
-    }
-  }
-  
-  // Hysteresis thresholding
+  // Count edge pixels
   let edgePixels = 0;
-  const edges = new Uint8ClampedArray(width * height);
-  
-  for (let i = 0; i < nms.length; i++) {
-    if (nms[i] >= highThreshold) {
-      edges[i] = 255;
-      edgePixels++;
-    } else if (nms[i] >= lowThreshold) {
-      edges[i] = 128;
-    }
+  for (let i = 0; i < gradient.length; i++) {
+    if (gradient[i] >= highThreshold) edgePixels++;
   }
   
   const edgeDensity = (edgePixels / (width * height)) * 100;
@@ -166,12 +132,11 @@ async function cannyEdgeDetection(base64Image, lowThreshold = 50, highThreshold 
  * 2. LAB COLOR DELTA-E
  */
 async function labColorDeltaE(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const data = imageData.data;
+  const { data, width, height } = await loadImageData(base64Image);
   
   // Sample colors from image
   const samples = [];
-  const step = Math.floor(Math.sqrt(width * height) / 100);
+  const step = Math.max(1, Math.floor(Math.sqrt(width * height) / 100));
   
   for (let y = 0; y < height; y += step) {
     for (let x = 0; x < width; x += step) {
@@ -193,7 +158,7 @@ async function labColorDeltaE(base64Image) {
     totalDelta += Math.sqrt(dr*dr + dg*dg + db*db);
   }
   
-  const avgDelta = totalDelta / (samples.length - 1);
+  const avgDelta = samples.length > 1 ? totalDelta / (samples.length - 1) : 0;
   const score = Math.max(0, 10 - (avgDelta / 50));
   
   return {
@@ -209,27 +174,27 @@ async function labColorDeltaE(base64Image) {
  * 3. LOCAL BINARY PATTERNS (LBP)
  */
 async function localBinaryPatterns(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   let uniformPatterns = 0;
   let totalPatterns = 0;
   
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
-      const center = gray.data[y * width + x];
+      const center = gray[y * width + x];
       let pattern = 0;
       
       // 8 neighbors
       const neighbors = [
-        gray.data[(y-1) * width + (x-1)],
-        gray.data[(y-1) * width + x],
-        gray.data[(y-1) * width + (x+1)],
-        gray.data[y * width + (x+1)],
-        gray.data[(y+1) * width + (x+1)],
-        gray.data[(y+1) * width + x],
-        gray.data[(y+1) * width + (x-1)],
-        gray.data[y * width + (x-1)]
+        gray[(y-1) * width + (x-1)],
+        gray[(y-1) * width + x],
+        gray[(y-1) * width + (x+1)],
+        gray[y * width + (x+1)],
+        gray[(y+1) * width + (x+1)],
+        gray[(y+1) * width + x],
+        gray[(y+1) * width + (x-1)],
+        gray[y * width + (x-1)]
       ];
       
       for (let i = 0; i < 8; i++) {
@@ -251,8 +216,8 @@ async function localBinaryPatterns(base64Image) {
     }
   }
   
-  const uniformity = (uniformPatterns / totalPatterns) * 100;
-  const score = (uniformity / 10);
+  const uniformity = totalPatterns > 0 ? (uniformPatterns / totalPatterns) * 100 : 0;
+  const score = uniformity / 10;
   
   return {
     name: 'Local Binary Patterns',
@@ -268,16 +233,16 @@ async function localBinaryPatterns(base64Image) {
  * 4. HISTOGRAM OF GRADIENTS (HOG)
  */
 async function histogramOfGradients(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   const bins = 9;
   const histogram = new Array(bins).fill(0);
   
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
-      const gx = gray.data[y * width + (x + 1)] - gray.data[y * width + (x - 1)];
-      const gy = gray.data[(y + 1) * width + x] - gray.data[(y - 1) * width + x];
+      const gx = gray[y * width + (x + 1)] - gray[y * width + (x - 1)];
+      const gy = gray[(y + 1) * width + x] - gray[(y - 1) * width + x];
       
       const magnitude = Math.sqrt(gx * gx + gy * gy);
       const angle = Math.atan2(gy, gx);
@@ -305,17 +270,17 @@ async function histogramOfGradients(base64Image) {
  * 5. ENTROPY ANALYSIS
  */
 async function entropyAnalysis(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   // Build histogram
   const histogram = new Array(256).fill(0);
-  for (let i = 0; i < gray.data.length; i++) {
-    histogram[gray.data[i]]++;
+  for (let i = 0; i < gray.length; i++) {
+    histogram[gray[i]]++;
   }
   
   // Calculate entropy
-  const total = gray.data.length;
+  const total = gray.length;
   let entropy = 0;
   
   for (let i = 0; i < 256; i++) {
@@ -340,11 +305,12 @@ async function entropyAnalysis(base64Image) {
  * 6. LAPLACIAN SHARPNESS
  */
 async function laplacianSharpness(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   const laplacian = [0, -1, 0, -1, 4, -1, 0, -1, 0];
   let variance = 0;
+  let count = 0;
   
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
@@ -354,15 +320,16 @@ async function laplacianSharpness(base64Image) {
         for (let kx = -1; kx <= 1; kx++) {
           const idx = (y + ky) * width + (x + kx);
           const ki = (ky + 1) * 3 + (kx + 1);
-          sum += gray.data[idx] * laplacian[ki];
+          sum += gray[idx] * laplacian[ki];
         }
       }
       
       variance += sum * sum;
+      count++;
     }
   }
   
-  variance /= ((width - 2) * (height - 2));
+  variance = count > 0 ? variance / count : 0;
   const score = Math.min(10, (variance / 1000) * 10);
   
   return {
@@ -377,19 +344,17 @@ async function laplacianSharpness(base64Image) {
  * 7. HARRIS CORNER DETECTION
  */
 async function harrisCornerDetection(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   let corners = 0;
   const threshold = 10000;
   
   for (let y = 2; y < height - 2; y++) {
     for (let x = 2; x < width - 2; x++) {
-      let Ix = 0, Iy = 0;
-      
       // Sobel gradient
-      Ix = (gray.data[y * width + (x + 1)] - gray.data[y * width + (x - 1)]) / 2;
-      Iy = (gray.data[(y + 1) * width + x] - gray.data[(y - 1) * width + x]) / 2;
+      const Ix = (gray[y * width + (x + 1)] - gray[y * width + (x - 1)]) / 2;
+      const Iy = (gray[(y + 1) * width + x] - gray[(y - 1) * width + x]) / 2;
       
       const Ixx = Ix * Ix;
       const Iyy = Iy * Iy;
@@ -422,31 +387,29 @@ async function harrisCornerDetection(base64Image) {
  * 8. HOUGH LINE TRANSFORM
  */
 async function houghLineTransform(base64Image) {
-  const { imageData, width, height } = await loadImageToCanvas(base64Image);
-  const gray = rgbToGrayscale(imageData);
+  const { data, width, height } = await loadImageData(base64Image);
+  const gray = rgbToGrayscale(data, width, height);
   
   // Simple edge detection
-  let edgePixels = [];
+  let edgeCount = 0;
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
-      const gx = gray.data[y * width + (x + 1)] - gray.data[y * width + (x - 1)];
-      const gy = gray.data[(y + 1) * width + x] - gray.data[(y - 1) * width + x];
+      const gx = gray[y * width + (x + 1)] - gray[y * width + (x - 1)];
+      const gy = gray[(y + 1) * width + x] - gray[(y - 1) * width + x];
       const magnitude = Math.sqrt(gx * gx + gy * gy);
       
-      if (magnitude > 50) {
-        edgePixels.push({ x, y });
-      }
+      if (magnitude > 50) edgeCount++;
     }
   }
   
   // Simplified Hough transform (only count strong lines)
-  const lines = Math.floor(edgePixels.length / 100);
+  const lines = Math.floor(edgeCount / 100);
   const score = Math.min(10, (lines / 10) * 10);
   
   return {
     name: 'Hough Line Transform',
     lines,
-    edgePixels: edgePixels.length,
+    edgePixels: edgeCount,
     score: score.toFixed(1),
     description: `Detected ${lines} linear structures. Straight borders indicate proper card cutting.`
   };
@@ -476,24 +439,30 @@ app.post('/api/cv', async (req, res) => {
     // PRO TIER (8 algorithms)
     if (tier === 'pro' || tier === 'expert' || tier === 'enterprise') {
       console.log('[CV Backend] Running PRO tier (8 algorithms)...');
+      
       results.push(await cannyEdgeDetection(image));
+      console.log('[CV Backend] ✓ Canny Edge Detection');
+      
       results.push(await labColorDeltaE(image));
+      console.log('[CV Backend] ✓ LAB Color Delta-E');
+      
       results.push(await localBinaryPatterns(image));
+      console.log('[CV Backend] ✓ Local Binary Patterns');
+      
       results.push(await histogramOfGradients(image));
+      console.log('[CV Backend] ✓ Histogram of Gradients');
+      
       results.push(await entropyAnalysis(image));
+      console.log('[CV Backend] ✓ Entropy Analysis');
+      
       results.push(await laplacianSharpness(image));
+      console.log('[CV Backend] ✓ Laplacian Sharpness');
+      
       results.push(await harrisCornerDetection(image));
+      console.log('[CV Backend] ✓ Harris Corner Detection');
+      
       results.push(await houghLineTransform(image));
-    }
-    
-    // EXPERT TIER (8 more algorithms) - TODO: Implement these
-    if (tier === 'expert' || tier === 'enterprise') {
-      console.log('[CV Backend] EXPERT tier algorithms not yet implemented');
-    }
-    
-    // ENTERPRISE TIER (4 ultimate algorithms) - TODO: Implement these
-    if (tier === 'enterprise') {
-      console.log('[CV Backend] ENTERPRISE tier algorithms not yet implemented');
+      console.log('[CV Backend] ✓ Hough Line Transform');
     }
     
     const processingTime = Date.now() - startTime;
@@ -519,7 +488,7 @@ app.post('/api/cv', async (req, res) => {
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 TCG-Forensics CV Backend running on port ${PORT}`);
-  console.log(`📊 Available algorithms: 8 PRO tier (EXPERT/ENTERPRISE coming soon)`);
+  console.log(`📊 Available algorithms: 8 PRO tier`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🎯 CV endpoint: POST http://localhost:${PORT}/api/cv\n`);
 });
