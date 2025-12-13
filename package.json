@@ -10,9 +10,11 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "@sparticuz/chromium": "^143.0.0",
     "cors": "^2.8.5",
-    "sharp": "^0.33.2",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "puppeteer-core": "^24.33.0",
+    "sharp": "^0.33.2"
   }
 }

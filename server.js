@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import sharp from 'sharp';
+import puppeteer from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -9,13 +11,17 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+// Cache for PSA scraped data
+const PSA_CACHE = new Map();
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'TCG-Forensics CV Backend',
-    version: '1.0.0',
-    algorithms: 8
+    version: '2.0.0',
+    algorithms: 8,
+    features: ['CV Analysis', 'PSA Scraping', 'Image Comparison']
   });
 });
 
@@ -486,57 +492,220 @@ app.post('/api/cv', async (req, res) => {
 });
 
 // ============================================================================
-// PSA REFERENCE SCRAPING & COMPARISON
+// PSA REFERENCE SCRAPING WITH PUPPETEER (Cloudflare Bypass)
 // ============================================================================
 
+let browserInstance = null;
+
 /**
- * Fetch PSA page and extract reference images
+ * Get or create browser instance
  */
-async function fetchPSAReference(certNumber) {
-  const psaUrl = `https://www.psacard.com/cert/${certNumber}`;
+async function getBrowser() {
+  if (browserInstance) return browserInstance;
+  
+  console.log('[Puppeteer] Launching browser...');
   
   try {
-    const response = await fetch(psaUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://www.google.com/'
-      }
+    browserInstance = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+    console.log('[Puppeteer] Browser launched successfully');
+    return browserInstance;
+  } catch (error) {
+    console.error('[Puppeteer] Failed to launch:', error.message);
+    // Fallback for local development
+    browserInstance = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    return browserInstance;
+  }
+}
+
+/**
+ * Scrape PSA page with Puppeteer - bypasses Cloudflare
+ */
+async function scrapePSAWithPuppeteer(certNumber) {
+  const psaUrl = `https://www.psacard.com/cert/${certNumber}`;
+  
+  // Check cache first
+  if (PSA_CACHE.has(certNumber)) {
+    console.log(`[PSA Scraper] Cache hit for ${certNumber}`);
+    return PSA_CACHE.get(certNumber);
+  }
+  
+  console.log(`[PSA Scraper] Scraping ${psaUrl} with Puppeteer...`);
+  
+  let browser = null;
+  let page = null;
+  
+  try {
+    browser = await getBrowser();
+    page = await browser.newPage();
+    
+    // Set realistic headers
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     });
     
-    const html = await response.text();
+    // Navigate and wait for content
+    await page.goto(psaUrl, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
     
-    // Check for Cloudflare block
-    if (html.includes('Just a moment') || html.includes('challenge-platform')) {
-      return { error: 'cloudflare_blocked', psaUrl };
-    }
+    // Wait a bit for dynamic content
+    await page.waitForTimeout(2000);
     
-    // Extract image URLs from PSA page
-    const imageMatches = html.match(/https:\/\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/gi) || [];
-    const psaImages = imageMatches.filter(url => 
-      url.includes('psacard') || url.includes('cert') || url.includes('card')
-    );
+    // Extract all data from page
+    const data = await page.evaluate(() => {
+      const result = {
+        grade: null,
+        cardName: null,
+        year: null,
+        setName: null,
+        variety: null,
+        images: [],
+        labelImage: null,
+        cardFrontImage: null,
+        cardBackImage: null,
+        allImages: []
+      };
+      
+      // Get all images on the page
+      const imgs = document.querySelectorAll('img');
+      imgs.forEach(img => {
+        const src = img.src || img.getAttribute('data-src') || '';
+        if (src && (src.includes('http') || src.startsWith('/'))) {
+          const fullUrl = src.startsWith('/') ? 'https://www.psacard.com' + src : src;
+          result.allImages.push(fullUrl);
+          
+          // Identify specific images
+          const alt = (img.alt || '').toLowerCase();
+          const className = (img.className || '').toLowerCase();
+          
+          if (alt.includes('front') || className.includes('front') || src.includes('front')) {
+            result.cardFrontImage = fullUrl;
+          }
+          if (alt.includes('back') || className.includes('back') || src.includes('back')) {
+            result.cardBackImage = fullUrl;
+          }
+          if (alt.includes('label') || className.includes('label') || src.includes('label')) {
+            result.labelImage = fullUrl;
+          }
+          if (src.includes('cert') || src.includes('card') || src.includes('pokemon')) {
+            result.images.push(fullUrl);
+          }
+        }
+      });
+      
+      // Try to get grade from various elements
+      const gradeSelectors = [
+        '.grade', '.cert-grade', '[class*="grade"]', 
+        'span:contains("Grade")', '.card-grade'
+      ];
+      for (const sel of gradeSelectors) {
+        try {
+          const el = document.querySelector(sel);
+          if (el && el.textContent) {
+            const match = el.textContent.match(/(\d+\.?\d*)/);
+            if (match) {
+              result.grade = match[1];
+              break;
+            }
+          }
+        } catch(e) {}
+      }
+      
+      // Get card name from page title or h1
+      const h1 = document.querySelector('h1');
+      if (h1) result.cardName = h1.textContent.trim();
+      
+      // Get from title tag
+      const title = document.title;
+      if (title && !result.cardName) {
+        result.cardName = title.replace(/PSA|Cert|Certificate|\|/gi, '').trim();
+      }
+      
+      // Try to find year
+      const yearMatch = document.body.textContent.match(/\b(19\d{2}|20[0-2]\d)\b/);
+      if (yearMatch) result.year = yearMatch[1];
+      
+      // Get full page HTML for debugging
+      result.pageTitle = document.title;
+      result.url = window.location.href;
+      
+      return result;
+    });
     
-    // Extract card info
-    const gradeMatch = html.match(/Grade[:\s]*<[^>]*>([^<]+)/i);
-    const nameMatch = html.match(/Card\s*Name[:\s]*<[^>]*>([^<]+)/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
-    const yearMatch = html.match(/Year[:\s]*<[^>]*>(\d{4})/i);
+    // Take screenshot of the page for reference
+    const screenshot = await page.screenshot({ 
+      encoding: 'base64',
+      fullPage: false,
+      type: 'jpeg',
+      quality: 80
+    });
     
-    return {
+    // Also try to get specific card images by clicking thumbnails
+    try {
+      const thumbnails = await page.$$('img[class*="thumb"], img[class*="gallery"], .card-image img');
+      for (const thumb of thumbnails.slice(0, 3)) {
+        const src = await thumb.evaluate(el => el.src || el.getAttribute('data-src') || el.getAttribute('data-full'));
+        if (src && !data.images.includes(src)) {
+          data.images.push(src);
+        }
+      }
+    } catch (e) {}
+    
+    await page.close();
+    
+    const result = {
       certNumber,
       psaUrl,
-      grade: gradeMatch ? gradeMatch[1].trim() : null,
-      cardName: nameMatch ? nameMatch[1].trim() : null,
-      year: yearMatch ? yearMatch[1] : null,
-      referenceImages: psaImages.slice(0, 5), // Max 5 images
-      found: true
+      grade: data.grade,
+      cardName: data.cardName,
+      year: data.year,
+      referenceImages: [...new Set(data.images)].slice(0, 10),
+      cardFrontImage: data.cardFrontImage,
+      cardBackImage: data.cardBackImage,
+      labelImage: data.labelImage,
+      allImages: [...new Set(data.allImages)],
+      screenshot: `data:image/jpeg;base64,${screenshot}`,
+      scraped: true,
+      scrapedAt: new Date().toISOString()
     };
     
+    // Cache the result
+    PSA_CACHE.set(certNumber, result);
+    
+    console.log(`[PSA Scraper] Found ${result.referenceImages.length} card images, ${result.allImages.length} total images`);
+    
+    return result;
+    
   } catch (error) {
-    console.error('[PSA Scraper] Error:', error.message);
-    return { error: error.message, psaUrl };
+    console.error('[PSA Scraper] Puppeteer error:', error.message);
+    if (page) await page.close().catch(() => {});
+    
+    return { 
+      error: error.message, 
+      psaUrl,
+      certNumber,
+      scraped: false
+    };
   }
+}
+
+/**
+ * Fetch PSA page - tries Puppeteer first, falls back to simple fetch
+ */
+async function fetchPSAReference(certNumber) {
+  // Always use Puppeteer for reliable scraping
+  return await scrapePSAWithPuppeteer(certNumber);
 }
 
 /**
@@ -882,26 +1051,249 @@ const KNOWN_PSA_CERTS = {
 app.get('/api/psa-reference/:certNumber', async (req, res) => {
   const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
   
-  // Check cache first
-  if (KNOWN_PSA_CERTS[certNumber]) {
-    return res.json({
-      ...KNOWN_PSA_CERTS[certNumber],
-      certNumber,
-      cached: true,
-      psaUrl: `https://www.psacard.com/cert/${certNumber}`
-    });
-  }
-  
-  // Scrape PSA
+  // Always scrape fresh with Puppeteer
   const psaRef = await fetchPSAReference(certNumber);
   res.json(psaRef);
 });
 
+/**
+ * Direct PSA scrape endpoint - returns screenshot and all images
+ */
+app.get('/api/psa-scrape/:certNumber', async (req, res) => {
+  const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
+  
+  console.log(`[PSA Scrape] Direct scrape request for cert #${certNumber}`);
+  
+  try {
+    const result = await scrapePSAWithPuppeteer(certNumber);
+    
+    if (result.error) {
+      return res.status(500).json(result);
+    }
+    
+    res.json({
+      success: true,
+      ...result
+    });
+    
+  } catch (error) {
+    console.error('[PSA Scrape] Error:', error);
+    res.status(500).json({
+      error: error.message,
+      certNumber
+    });
+  }
+});
+
+/**
+ * Download PSA image and return as base64
+ */
+app.get('/api/psa-image', async (req, res) => {
+  const imageUrl = req.query.url;
+  
+  if (!imageUrl) {
+    return res.status(400).json({ error: 'Missing url parameter' });
+  }
+  
+  try {
+    console.log(`[PSA Image] Downloading: ${imageUrl}`);
+    
+    const response = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.psacard.com/'
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const base64 = buffer.toString('base64');
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    
+    res.json({
+      success: true,
+      imageUrl,
+      base64: `data:${contentType};base64,${base64}`,
+      size: buffer.length
+    });
+    
+  } catch (error) {
+    console.error('[PSA Image] Error:', error.message);
+    res.status(500).json({
+      error: error.message,
+      imageUrl
+    });
+  }
+});
+
+/**
+ * Full PSA verification with image comparison
+ */
+app.post('/api/psa-verify', async (req, res) => {
+  const { userImages, certNumber } = req.body;
+  
+  if (!certNumber) {
+    return res.status(400).json({ error: 'Missing certNumber' });
+  }
+  
+  console.log(`[PSA Verify] Full verification for cert #${certNumber}`);
+  const startTime = Date.now();
+  
+  try {
+    // Step 1: Scrape PSA page
+    console.log('[PSA Verify] Step 1: Scraping PSA page...');
+    const psaData = await scrapePSAWithPuppeteer(certNumber);
+    
+    if (psaData.error) {
+      return res.json({
+        success: false,
+        error: psaData.error,
+        psaUrl: psaData.psaUrl
+      });
+    }
+    
+    // Step 2: Download PSA reference images
+    console.log('[PSA Verify] Step 2: Downloading reference images...');
+    const referenceImages = [];
+    
+    for (const imgUrl of psaData.allImages.slice(0, 5)) {
+      try {
+        const imgResponse = await fetch(imgUrl, {
+          headers: { 
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://www.psacard.com/'
+          }
+        });
+        
+        if (imgResponse.ok) {
+          const buffer = Buffer.from(await imgResponse.arrayBuffer());
+          
+          // Process with sharp
+          const processed = await sharp(buffer)
+            .resize(900, 1200, { fit: 'contain', background: { r: 255, g: 255, b: 255 } })
+            .ensureAlpha()
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+          
+          referenceImages.push({
+            url: imgUrl,
+            data: new Uint8ClampedArray(processed.data),
+            width: processed.info.width,
+            height: processed.info.height,
+            base64: `data:image/jpeg;base64,${buffer.toString('base64')}`
+          });
+          
+          console.log(`[PSA Verify] Downloaded: ${imgUrl}`);
+        }
+      } catch (e) {
+        console.log(`[PSA Verify] Failed to download: ${imgUrl}`);
+      }
+    }
+    
+    // Step 3: Compare with user images (if provided)
+    let comparisonResults = [];
+    
+    if (userImages && userImages.length > 0 && referenceImages.length > 0) {
+      console.log('[PSA Verify] Step 3: Comparing images...');
+      
+      for (const userImg of userImages.slice(0, 3)) {
+        // Load user image
+        const userBuffer = Buffer.from(userImg.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+        const userProcessed = await sharp(userBuffer)
+          .resize(900, 1200, { fit: 'contain', background: { r: 255, g: 255, b: 255 } })
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        
+        const userData = new Uint8ClampedArray(userProcessed.data);
+        
+        // Compare against each reference
+        for (const ref of referenceImages) {
+          const colorCorr = calculateHistogramCorrelation(userData, ref.data, 900, 1200);
+          const ssim = calculateSSIM(userData, ref.data, 900, 1200);
+          const userSharp = calculateSharpness(userData, 900, 1200);
+          const refSharp = calculateSharpness(ref.data, ref.width, ref.height);
+          
+          comparisonResults.push({
+            referenceUrl: ref.url,
+            colorCorrelation: (colorCorr * 100).toFixed(1),
+            structuralSimilarity: (ssim * 100).toFixed(1),
+            userSharpness: userSharp.toFixed(0),
+            refSharpness: refSharp.toFixed(0),
+            sharpnessDiff: Math.abs(userSharp - refSharp).toFixed(0)
+          });
+        }
+      }
+    }
+    
+    // Step 4: Calculate authenticity score
+    let score = 100;
+    const warnings = [];
+    
+    if (comparisonResults.length > 0) {
+      const avgColorCorr = comparisonResults.reduce((a, r) => a + parseFloat(r.colorCorrelation), 0) / comparisonResults.length;
+      const avgSSIM = comparisonResults.reduce((a, r) => a + parseFloat(r.structuralSimilarity), 0) / comparisonResults.length;
+      const avgSharpDiff = comparisonResults.reduce((a, r) => a + parseFloat(r.sharpnessDiff), 0) / comparisonResults.length;
+      
+      if (avgColorCorr < 70) {
+        score -= 25;
+        warnings.push(`Low color match: ${avgColorCorr.toFixed(1)}%`);
+      }
+      if (avgSSIM < 60) {
+        score -= 25;
+        warnings.push(`Low structural similarity: ${avgSSIM.toFixed(1)}%`);
+      }
+      if (avgSharpDiff > 100) {
+        score -= 20;
+        warnings.push(`Sharpness difference: ${avgSharpDiff.toFixed(0)}`);
+      }
+    }
+    
+    let verdict = score >= 75 ? 'LIKELY_AUTHENTIC' : score >= 50 ? 'SUSPICIOUS' : 'LIKELY_FAKE';
+    
+    const processingTime = Date.now() - startTime;
+    
+    res.json({
+      success: true,
+      certNumber,
+      psaData: {
+        grade: psaData.grade,
+        cardName: psaData.cardName,
+        year: psaData.year,
+        psaUrl: psaData.psaUrl,
+        screenshot: psaData.screenshot
+      },
+      referenceImages: referenceImages.map(r => ({
+        url: r.url,
+        base64: r.base64
+      })),
+      comparison: comparisonResults,
+      authenticity: {
+        score,
+        verdict,
+        warnings
+      },
+      processingTime: `${processingTime}ms`
+    });
+    
+  } catch (error) {
+    console.error('[PSA Verify] Error:', error);
+    res.status(500).json({
+      error: error.message,
+      certNumber
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 TCG-Forensics CV Backend running on port ${PORT}`);
-  console.log(`📊 Available algorithms: 8 PRO tier`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🎯 CV endpoint: POST http://localhost:${PORT}/api/cv`);
-  console.log(`🔍 PSA Compare: POST http://localhost:${PORT}/api/psa-compare\n`);
+  console.log(`\n🚀 TCG-Forensics CV Backend v2.0 running on port ${PORT}`);
+  console.log(`📊 Available: 8 CV algorithms + PSA Scraping`);
+  console.log(`🔗 Health: http://localhost:${PORT}/health`);
+  console.log(`🎯 CV: POST http://localhost:${PORT}/api/cv`);
+  console.log(`🔍 PSA Scrape: GET http://localhost:${PORT}/api/psa-scrape/:certNumber`);
+  console.log(`✅ PSA Verify: POST http://localhost:${PORT}/api/psa-verify\n`);
 });
