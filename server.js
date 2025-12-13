@@ -18,7 +18,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'TCG-Forensics CV Backend',
-    version: '2.1.1',
+    version: '2.2.0',
     algorithms: 8,
     features: ['CV Analysis', 'PSA Scraping', 'Image Comparison']
   });
@@ -1049,18 +1049,147 @@ const KNOWN_PSA_CERTS = {
     cardName: 'Lugia Holo 1st Edition',
     set: 'Neo Genesis',
     year: '2000',
-    // Real PSA reference images (from psacard.com or cached)
     referenceImages: []
   }
 };
 
 /**
- * Get PSA reference data (cached or scraped)
+ * PSA Official API Endpoint
+ * Uses https://api.psacard.com/publicapi/cert/GetByCertNumber/{certNumber}
+ * Requires PSA_API_TOKEN environment variable
+ */
+app.get('/api/psa-official/:certNumber', async (req, res) => {
+  const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
+  const PSA_API_TOKEN = process.env.PSA_API_TOKEN;
+  
+  if (!PSA_API_TOKEN) {
+    return res.json({
+      success: false,
+      error: 'PSA_API_TOKEN not configured',
+      message: 'Please set PSA_API_TOKEN environment variable',
+      certNumber,
+      psaUrl: `https://www.psacard.com/cert/${certNumber}`
+    });
+  }
+  
+  console.log(`[PSA Official API] Fetching cert #${certNumber}...`);
+  
+  try {
+    const response = await fetch(`https://api.psacard.com/publicapi/cert/GetByCertNumber/${certNumber}`, {
+      headers: {
+        'Authorization': `bearer ${PSA_API_TOKEN}`,
+        'Accept': 'application/json'
+      }
+    });
+    
+    const data = await response.json();
+    
+    if (data.IsValidRequest && data.ServerMessage === 'Request successful') {
+      // Extract cert info from PSA API response
+      const cert = data.PSACert || data;
+      
+      res.json({
+        success: true,
+        source: 'psa_official_api',
+        certNumber,
+        grade: cert.CardGrade || cert.Grade,
+        cardName: cert.Subject || cert.CardName,
+        year: cert.Year,
+        set: cert.SetYear || cert.Brand,
+        variety: cert.Variety,
+        category: cert.Category,
+        labelType: cert.LabelType,
+        specNumber: cert.SpecNumber,
+        population: cert.TotalPopulation,
+        // PSA doesn't provide images via API, but we have cert page URL
+        psaUrl: `https://www.psacard.com/cert/${certNumber}`,
+        psaCertPageUrl: cert.CertUrl || `https://www.psacard.com/cert/${certNumber}`,
+        rawData: data
+      });
+    } else {
+      // Cert not found or invalid
+      res.json({
+        success: false,
+        error: data.ServerMessage || 'Cert not found',
+        certNumber,
+        psaUrl: `https://www.psacard.com/cert/${certNumber}`,
+        rawData: data
+      });
+    }
+    
+  } catch (error) {
+    console.error('[PSA Official API] Error:', error.message);
+    res.json({
+      success: false,
+      error: error.message,
+      certNumber,
+      psaUrl: `https://www.psacard.com/cert/${certNumber}`
+    });
+  }
+});
+
+/**
+ * Get PSA reference data (cached, official API, or scraped)
  */
 app.get('/api/psa-reference/:certNumber', async (req, res) => {
   const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
   
-  // Always scrape fresh with Puppeteer
+  // Check cache first
+  if (PSA_CACHE.has(certNumber)) {
+    console.log(`[PSA Reference] Cache hit for ${certNumber}`);
+    return res.json({ ...PSA_CACHE.get(certNumber), source: 'cache' });
+  }
+  
+  // Check known certs
+  if (KNOWN_PSA_CERTS[certNumber]) {
+    console.log(`[PSA Reference] Known cert: ${certNumber}`);
+    return res.json({ 
+      ...KNOWN_PSA_CERTS[certNumber], 
+      certNumber,
+      psaUrl: `https://www.psacard.com/cert/${certNumber}`,
+      source: 'known_database' 
+    });
+  }
+  
+  // Try official PSA API if token is available
+  const PSA_API_TOKEN = process.env.PSA_API_TOKEN;
+  if (PSA_API_TOKEN) {
+    try {
+      console.log(`[PSA Reference] Trying official API for ${certNumber}...`);
+      const apiResponse = await fetch(`https://api.psacard.com/publicapi/cert/GetByCertNumber/${certNumber}`, {
+        headers: {
+          'Authorization': `bearer ${PSA_API_TOKEN}`,
+          'Accept': 'application/json'
+        }
+      });
+      
+      const apiData = await apiResponse.json();
+      
+      if (apiData.IsValidRequest && apiData.ServerMessage === 'Request successful') {
+        const cert = apiData.PSACert || apiData;
+        const result = {
+          certNumber,
+          grade: cert.CardGrade || cert.Grade,
+          cardName: cert.Subject || cert.CardName,
+          year: cert.Year,
+          set: cert.SetYear || cert.Brand,
+          variety: cert.Variety,
+          psaUrl: `https://www.psacard.com/cert/${certNumber}`,
+          source: 'psa_official_api',
+          scraped: false
+        };
+        
+        // Cache the result
+        PSA_CACHE.set(certNumber, result);
+        return res.json(result);
+      }
+    } catch (apiError) {
+      console.log(`[PSA Reference] Official API failed: ${apiError.message}`);
+    }
+  }
+  
+  // Fallback to Puppeteer scraping
+  console.log(`[PSA Reference] Falling back to Puppeteer scraping for ${certNumber}...`);
   const psaRef = await fetchPSAReference(certNumber);
   res.json(psaRef);
 });
@@ -1299,10 +1428,12 @@ app.post('/api/psa-verify', async (req, res) => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 TCG-Forensics CV Backend v2.1.1 running on port ${PORT}`);
-  console.log(`📊 Available: 8 CV algorithms + PSA Scraping`);
+  console.log(`\n🚀 TCG-Forensics CV Backend v2.2.0 running on port ${PORT}`);
+  console.log(`📊 Available: 8 CV algorithms + PSA API/Scraping`);
   console.log(`🔗 Health: http://localhost:${PORT}/health`);
   console.log(`🎯 CV: POST http://localhost:${PORT}/api/cv`);
+  console.log(`🔍 PSA Official: GET http://localhost:${PORT}/api/psa-official/:certNumber`);
   console.log(`🔍 PSA Scrape: GET http://localhost:${PORT}/api/psa-scrape/:certNumber`);
-  console.log(`✅ PSA Verify: POST http://localhost:${PORT}/api/psa-verify\n`);
+  console.log(`✅ PSA Verify: POST http://localhost:${PORT}/api/psa-verify`);
+  console.log(`💡 Set PSA_API_TOKEN env var for official PSA API access\n`);
 });
