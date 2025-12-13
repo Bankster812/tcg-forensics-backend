@@ -535,11 +535,7 @@ async function scrapePSAWithFirecrawl(certNumber) {
       },
       body: JSON.stringify({
         url: psaUrl,
-        formats: ['markdown', 'html', 'screenshot', 'images'],
-        screenshot: {
-          fullPage: false,
-          quality: 90
-        },
+        formats: ['markdown', 'html', 'screenshot'],
         waitFor: 3000, // Wait 3s for dynamic content
         timeout: 30000
       })
@@ -562,32 +558,60 @@ async function scrapePSAWithFirecrawl(certNumber) {
     // Extract PSA data from markdown/HTML
     const markdown = scraped.markdown || '';
     const html = scraped.html || '';
-    const images = scraped.images || [];
-    const screenshot = scraped.screenshot;
+    const screenshot = scraped.screenshot; // This is a URL now, not base64
     
-    // Parse grade from content
+    // Parse grade from content - look for GEM MT 10, MINT 9, etc.
     let grade = null;
-    const gradeMatch = markdown.match(/Grade[:\s]*(\d+\.?\d*)/i) || html.match(/grade[:\s]*(\d+\.?\d*)/i);
+    const gradeMatch = markdown.match(/GEM\s*MT\s*(\d+)/i) || 
+                       markdown.match(/MINT\s*(\d+)/i) ||
+                       markdown.match(/Item\s*Grade[:\s]*[A-Z\s]*(\d+)/i);
     if (gradeMatch) grade = gradeMatch[1];
     
-    // Parse card name
-    let cardName = scraped.metadata?.title?.replace(/PSA|Cert|Certificate|\||-/gi, '').trim() || null;
-    const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
-    if (h1Match) cardName = h1Match[1].trim();
+    // Parse card name from the big title
+    let cardName = null;
+    const titleMatch = markdown.match(/(\d{4}\s+[A-Z\s]+#\d+\s+[A-Z\-]+)/i);
+    if (titleMatch) cardName = titleMatch[1].trim();
+    if (!cardName) {
+      cardName = scraped.metadata?.title?.replace(/Cert\s*Verification\s*\d+/gi, '').trim() || null;
+    }
     
     // Parse year
     let year = null;
-    const yearMatch = markdown.match(/\b(19\d{2}|20[0-2]\d)\b/);
+    const yearMatch = markdown.match(/Year(\d{4})/i) || markdown.match(/\b(19\d{2}|20[0-2]\d)\b/);
     if (yearMatch) year = yearMatch[1];
     
-    // Filter card-related images
-    const cardImages = images.filter(img => 
-      img.includes('cert') || 
-      img.includes('card') || 
-      img.includes('pokemon') ||
-      img.includes('psa') ||
-      img.includes('image')
-    );
+    // Extract PSA card images from cloudfront URLs
+    const cloudFrontImages = [];
+    const imgRegex = /https:\/\/d1htnxwo4o0jhw\.cloudfront\.net\/cert\/\d+\/[a-z]+\/\d+\.jpg/gi;
+    let match;
+    while ((match = imgRegex.exec(html)) !== null) {
+      cloudFrontImages.push(match[0]);
+    }
+    
+    // Also check markdown for image URLs
+    const mdImgRegex = /https:\/\/d1htnxwo4o0jhw\.cloudfront\.net[^\s\)]+\.jpg/gi;
+    while ((match = mdImgRegex.exec(markdown)) !== null) {
+      if (!cloudFrontImages.includes(match[0])) {
+        cloudFrontImages.push(match[0]);
+      }
+    }
+    
+    // Get unique images
+    const uniqueImages = [...new Set(cloudFrontImages)];
+    
+    // Separate front and back images
+    const cardFrontImage = uniqueImages[0] || null; // First image is usually front
+    const cardBackImage = uniqueImages[1] || null;  // Second is usually back
+    
+    // Parse PSA estimate price
+    let psaEstimate = null;
+    const priceMatch = markdown.match(/PSA\s*Estimate\s*\$?([\d,]+\.?\d*)/i);
+    if (priceMatch) psaEstimate = priceMatch[1];
+    
+    // Parse population
+    let population = null;
+    const popMatch = markdown.match(/PSA\s*Population\s*\[?(\d+)/i);
+    if (popMatch) population = popMatch[1];
     
     const result = {
       certNumber,
@@ -595,10 +619,12 @@ async function scrapePSAWithFirecrawl(certNumber) {
       grade,
       cardName,
       year,
-      referenceImages: cardImages.slice(0, 10),
-      allImages: images,
-      screenshot: screenshot ? `data:image/png;base64,${screenshot}` : null,
-      markdown: markdown.substring(0, 2000), // First 2000 chars for context
+      psaEstimate,
+      population,
+      cardFrontImage,
+      cardBackImage,
+      referenceImages: uniqueImages,
+      screenshot, // URL from Firecrawl
       scraped: true,
       source: 'firecrawl',
       scrapedAt: new Date().toISOString()
@@ -607,7 +633,7 @@ async function scrapePSAWithFirecrawl(certNumber) {
     // Cache the result
     PSA_CACHE.set(certNumber, result);
     
-    console.log(`[Firecrawl] Success! Found ${cardImages.length} card images, ${images.length} total`);
+    console.log(`[Firecrawl] Success! Grade: ${grade}, Card: ${cardName}, Images: ${uniqueImages.length}`);
     
     return result;
     
