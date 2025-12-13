@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import sharp from 'sharp';
-import puppeteer from 'puppeteer';
+// Puppeteer removed - using Firecrawl instead for PSA scraping
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -18,9 +18,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'TCG-Forensics CV Backend',
-    version: '2.2.0',
+    version: '3.0.0',
     algorithms: 8,
-    features: ['CV Analysis', 'PSA Scraping', 'Image Comparison']
+    features: ['CV Analysis', 'PSA Firecrawl', 'Image Comparison'],
+    firecrawlConfigured: !!process.env.FIRECRAWL_API_KEY,
+    psaApiConfigured: !!process.env.PSA_API_TOKEN
   });
 });
 
@@ -491,230 +493,142 @@ app.post('/api/cv', async (req, res) => {
 });
 
 // ============================================================================
-// PSA REFERENCE SCRAPING WITH PUPPETEER (Cloudflare Bypass)
+// PSA REFERENCE SCRAPING WITH FIRECRAWL (Cloudflare Bypass)
 // ============================================================================
 
-let browserInstance = null;
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY;
 
 /**
- * Get or create browser instance
+ * Scrape PSA page with Firecrawl - professional scraping service
+ * Bypasses Cloudflare, extracts images and screenshots
  */
-async function getBrowser() {
-  if (browserInstance) return browserInstance;
-  
-  console.log('[Puppeteer] Launching browser...');
-  
-  // Use system Chromium if available (for Docker/Railway)
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-  
-  if (executablePath) {
-    console.log(`[Puppeteer] Using system Chromium: ${executablePath}`);
-  }
-  
-  try {
-    browserInstance = await puppeteer.launch({
-      headless: 'new',
-      executablePath,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--single-process'
-      ]
-    });
-    console.log('[Puppeteer] Browser launched successfully');
-    return browserInstance;
-  } catch (error) {
-    console.error('[Puppeteer] Failed to launch:', error.message);
-    throw error;
-  }
-}
-
-/**
- * Scrape PSA page with Puppeteer - bypasses Cloudflare
- */
-async function scrapePSAWithPuppeteer(certNumber) {
+async function scrapePSAWithFirecrawl(certNumber) {
   const psaUrl = `https://www.psacard.com/cert/${certNumber}`;
   
   // Check cache first
   if (PSA_CACHE.has(certNumber)) {
-    console.log(`[PSA Scraper] Cache hit for ${certNumber}`);
+    console.log(`[Firecrawl] Cache hit for ${certNumber}`);
     return PSA_CACHE.get(certNumber);
   }
   
-  console.log(`[PSA Scraper] Scraping ${psaUrl} with Puppeteer...`);
+  if (!FIRECRAWL_API_KEY) {
+    console.log('[Firecrawl] No API key configured, returning manual verification');
+    return {
+      error: 'firecrawl_not_configured',
+      message: 'Firecrawl API key not configured. Set FIRECRAWL_API_KEY env var.',
+      psaUrl,
+      certNumber,
+      scraped: false,
+      manualVerificationRequired: true
+    };
+  }
   
-  let browser = null;
-  let page = null;
+  console.log(`[Firecrawl] Scraping ${psaUrl}...`);
   
   try {
-    browser = await getBrowser();
-    page = await browser.newPage();
-    
-    // Set realistic headers
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+    // Call Firecrawl API with screenshot and images extraction
+    const response = await fetch('https://api.firecrawl.dev/v1/scrape', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${FIRECRAWL_API_KEY}`
+      },
+      body: JSON.stringify({
+        url: psaUrl,
+        formats: ['markdown', 'html', 'screenshot', 'images'],
+        screenshot: {
+          fullPage: false,
+          quality: 90
+        },
+        waitFor: 3000, // Wait 3s for dynamic content
+        timeout: 30000
+      })
     });
     
-    // Navigate and wait for content
-    await page.goto(psaUrl, { 
-      waitUntil: 'networkidle2',
-      timeout: 30000 
-    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[Firecrawl] API Error:', errorText);
+      throw new Error(`Firecrawl API error: ${response.status}`);
+    }
     
-    // Wait a bit for dynamic content
-    await page.waitForTimeout(2000);
+    const data = await response.json();
     
-    // Extract all data from page
-    const data = await page.evaluate(() => {
-      const result = {
-        grade: null,
-        cardName: null,
-        year: null,
-        setName: null,
-        variety: null,
-        images: [],
-        labelImage: null,
-        cardFrontImage: null,
-        cardBackImage: null,
-        allImages: []
-      };
-      
-      // Get all images on the page
-      const imgs = document.querySelectorAll('img');
-      imgs.forEach(img => {
-        const src = img.src || img.getAttribute('data-src') || '';
-        if (src && (src.includes('http') || src.startsWith('/'))) {
-          const fullUrl = src.startsWith('/') ? 'https://www.psacard.com' + src : src;
-          result.allImages.push(fullUrl);
-          
-          // Identify specific images
-          const alt = (img.alt || '').toLowerCase();
-          const className = (img.className || '').toLowerCase();
-          
-          if (alt.includes('front') || className.includes('front') || src.includes('front')) {
-            result.cardFrontImage = fullUrl;
-          }
-          if (alt.includes('back') || className.includes('back') || src.includes('back')) {
-            result.cardBackImage = fullUrl;
-          }
-          if (alt.includes('label') || className.includes('label') || src.includes('label')) {
-            result.labelImage = fullUrl;
-          }
-          if (src.includes('cert') || src.includes('card') || src.includes('pokemon')) {
-            result.images.push(fullUrl);
-          }
-        }
-      });
-      
-      // Try to get grade from various elements
-      const gradeSelectors = [
-        '.grade', '.cert-grade', '[class*="grade"]', 
-        'span:contains("Grade")', '.card-grade'
-      ];
-      for (const sel of gradeSelectors) {
-        try {
-          const el = document.querySelector(sel);
-          if (el && el.textContent) {
-            const match = el.textContent.match(/(\d+\.?\d*)/);
-            if (match) {
-              result.grade = match[1];
-              break;
-            }
-          }
-        } catch(e) {}
-      }
-      
-      // Get card name from page title or h1
-      const h1 = document.querySelector('h1');
-      if (h1) result.cardName = h1.textContent.trim();
-      
-      // Get from title tag
-      const title = document.title;
-      if (title && !result.cardName) {
-        result.cardName = title.replace(/PSA|Cert|Certificate|\|/gi, '').trim();
-      }
-      
-      // Try to find year
-      const yearMatch = document.body.textContent.match(/\b(19\d{2}|20[0-2]\d)\b/);
-      if (yearMatch) result.year = yearMatch[1];
-      
-      // Get full page HTML for debugging
-      result.pageTitle = document.title;
-      result.url = window.location.href;
-      
-      return result;
-    });
+    if (!data.success) {
+      throw new Error(data.error || 'Firecrawl scrape failed');
+    }
     
-    // Take screenshot of the page for reference
-    const screenshot = await page.screenshot({ 
-      encoding: 'base64',
-      fullPage: false,
-      type: 'jpeg',
-      quality: 80
-    });
+    const scraped = data.data;
     
-    // Also try to get specific card images by clicking thumbnails
-    try {
-      const thumbnails = await page.$$('img[class*="thumb"], img[class*="gallery"], .card-image img');
-      for (const thumb of thumbnails.slice(0, 3)) {
-        const src = await thumb.evaluate(el => el.src || el.getAttribute('data-src') || el.getAttribute('data-full'));
-        if (src && !data.images.includes(src)) {
-          data.images.push(src);
-        }
-      }
-    } catch (e) {}
+    // Extract PSA data from markdown/HTML
+    const markdown = scraped.markdown || '';
+    const html = scraped.html || '';
+    const images = scraped.images || [];
+    const screenshot = scraped.screenshot;
     
-    await page.close();
+    // Parse grade from content
+    let grade = null;
+    const gradeMatch = markdown.match(/Grade[:\s]*(\d+\.?\d*)/i) || html.match(/grade[:\s]*(\d+\.?\d*)/i);
+    if (gradeMatch) grade = gradeMatch[1];
+    
+    // Parse card name
+    let cardName = scraped.metadata?.title?.replace(/PSA|Cert|Certificate|\||-/gi, '').trim() || null;
+    const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+    if (h1Match) cardName = h1Match[1].trim();
+    
+    // Parse year
+    let year = null;
+    const yearMatch = markdown.match(/\b(19\d{2}|20[0-2]\d)\b/);
+    if (yearMatch) year = yearMatch[1];
+    
+    // Filter card-related images
+    const cardImages = images.filter(img => 
+      img.includes('cert') || 
+      img.includes('card') || 
+      img.includes('pokemon') ||
+      img.includes('psa') ||
+      img.includes('image')
+    );
     
     const result = {
       certNumber,
       psaUrl,
-      grade: data.grade,
-      cardName: data.cardName,
-      year: data.year,
-      referenceImages: [...new Set(data.images)].slice(0, 10),
-      cardFrontImage: data.cardFrontImage,
-      cardBackImage: data.cardBackImage,
-      labelImage: data.labelImage,
-      allImages: [...new Set(data.allImages)],
-      screenshot: `data:image/jpeg;base64,${screenshot}`,
+      grade,
+      cardName,
+      year,
+      referenceImages: cardImages.slice(0, 10),
+      allImages: images,
+      screenshot: screenshot ? `data:image/png;base64,${screenshot}` : null,
+      markdown: markdown.substring(0, 2000), // First 2000 chars for context
       scraped: true,
+      source: 'firecrawl',
       scrapedAt: new Date().toISOString()
     };
     
     // Cache the result
     PSA_CACHE.set(certNumber, result);
     
-    console.log(`[PSA Scraper] Found ${result.referenceImages.length} card images, ${result.allImages.length} total images`);
+    console.log(`[Firecrawl] Success! Found ${cardImages.length} card images, ${images.length} total`);
     
     return result;
     
   } catch (error) {
-    console.error('[PSA Scraper] Puppeteer error:', error.message);
-    if (page) await page.close().catch(() => {});
+    console.error('[Firecrawl] Error:', error.message);
     
-    return { 
-      error: error.message, 
+    return {
+      error: error.message,
       psaUrl,
       certNumber,
-      scraped: false
+      scraped: false,
+      manualVerificationRequired: true
     };
   }
 }
 
 /**
- * Fetch PSA page - tries Puppeteer first, falls back to simple fetch
+ * Fetch PSA page - tries Firecrawl first
  */
 async function fetchPSAReference(certNumber) {
-  // Always use Puppeteer for reliable scraping
-  return await scrapePSAWithPuppeteer(certNumber);
+  return await scrapePSAWithFirecrawl(certNumber);
 }
 
 /**
@@ -1428,12 +1342,14 @@ app.post('/api/psa-verify', async (req, res) => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 TCG-Forensics CV Backend v2.2.0 running on port ${PORT}`);
-  console.log(`📊 Available: 8 CV algorithms + PSA API/Scraping`);
+  console.log(`\n🚀 TCG-Forensics CV Backend v3.0.0 running on port ${PORT}`);
+  console.log(`📊 Available: 8 CV algorithms + Firecrawl PSA Scraping`);
   console.log(`🔗 Health: http://localhost:${PORT}/health`);
   console.log(`🎯 CV: POST http://localhost:${PORT}/api/cv`);
   console.log(`🔍 PSA Official: GET http://localhost:${PORT}/api/psa-official/:certNumber`);
-  console.log(`🔍 PSA Scrape: GET http://localhost:${PORT}/api/psa-scrape/:certNumber`);
+  console.log(`🔥 PSA Firecrawl: GET http://localhost:${PORT}/api/psa-scrape/:certNumber`);
   console.log(`✅ PSA Verify: POST http://localhost:${PORT}/api/psa-verify`);
-  console.log(`💡 Set PSA_API_TOKEN env var for official PSA API access\n`);
+  console.log(`\n💡 ENV VARS:`);
+  console.log(`   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY ? '✅ Configured' : '❌ Not set'}`);
+  console.log(`   PSA_API_TOKEN: ${process.env.PSA_API_TOKEN ? '✅ Configured' : '❌ Not set'}\n`);
 });
