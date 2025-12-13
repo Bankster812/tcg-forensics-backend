@@ -1,8 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import sharp from 'sharp';
-import puppeteer from 'puppeteer-core';
-import chromium from '@sparticuz/chromium';
+import puppeteer from 'puppeteer';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -19,7 +18,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'TCG-Forensics CV Backend',
-    version: '2.0.0',
+    version: '2.1.1',
     algorithms: 8,
     features: ['CV Analysis', 'PSA Scraping', 'Image Comparison']
   });
@@ -505,23 +504,33 @@ async function getBrowser() {
   
   console.log('[Puppeteer] Launching browser...');
   
+  // Use system Chromium if available (for Docker/Railway)
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+  
+  if (executablePath) {
+    console.log(`[Puppeteer] Using system Chromium: ${executablePath}`);
+  }
+  
   try {
     browserInstance = await puppeteer.launch({
-      args: chromium.args,
-      defaultViewport: chromium.defaultViewport,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
+      headless: 'new',
+      executablePath,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process'
+      ]
     });
     console.log('[Puppeteer] Browser launched successfully');
     return browserInstance;
   } catch (error) {
     console.error('[Puppeteer] Failed to launch:', error.message);
-    // Fallback for local development
-    browserInstance = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    return browserInstance;
+    throw error;
   }
 }
 
@@ -1290,7 +1299,7 @@ app.post('/api/psa-verify', async (req, res) => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 TCG-Forensics CV Backend v2.0 running on port ${PORT}`);
+  console.log(`\n🚀 TCG-Forensics CV Backend v2.1.1 running on port ${PORT}`);
   console.log(`📊 Available: 8 CV algorithms + PSA Scraping`);
   console.log(`🔗 Health: http://localhost:${PORT}/health`);
   console.log(`🎯 CV: POST http://localhost:${PORT}/api/cv`);
