@@ -1109,18 +1109,22 @@ app.get('/api/psa-reference/:certNumber', async (req, res) => {
 });
 
 /**
- * Direct PSA scrape endpoint - returns screenshot and all images
+ * Direct PSA scrape endpoint - uses Firecrawl for Cloudflare bypass
+ * Returns screenshot and all images from PSA cert page
  */
 app.get('/api/psa-scrape/:certNumber', async (req, res) => {
   const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
   
-  console.log(`[PSA Scrape] Direct scrape request for cert #${certNumber}`);
+  console.log(`[PSA Firecrawl] Scrape request for cert #${certNumber}`);
   
   try {
-    const result = await scrapePSAWithPuppeteer(certNumber);
+    const result = await scrapePSAWithFirecrawl(certNumber);
     
-    if (result.error) {
-      return res.status(500).json(result);
+    if (result.error && !result.scraped) {
+      return res.json({
+        success: false,
+        ...result
+      });
     }
     
     res.json({
@@ -1129,10 +1133,11 @@ app.get('/api/psa-scrape/:certNumber', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('[PSA Scrape] Error:', error);
+    console.error('[PSA Firecrawl] Error:', error);
     res.status(500).json({
       error: error.message,
-      certNumber
+      certNumber,
+      psaUrl: `https://www.psacard.com/cert/${certNumber}`
     });
   }
 });
