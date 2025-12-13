@@ -485,10 +485,423 @@ app.post('/api/cv', async (req, res) => {
   }
 });
 
+// ============================================================================
+// PSA REFERENCE SCRAPING & COMPARISON
+// ============================================================================
+
+/**
+ * Fetch PSA page and extract reference images
+ */
+async function fetchPSAReference(certNumber) {
+  const psaUrl = `https://www.psacard.com/cert/${certNumber}`;
+  
+  try {
+    const response = await fetch(psaUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://www.google.com/'
+      }
+    });
+    
+    const html = await response.text();
+    
+    // Check for Cloudflare block
+    if (html.includes('Just a moment') || html.includes('challenge-platform')) {
+      return { error: 'cloudflare_blocked', psaUrl };
+    }
+    
+    // Extract image URLs from PSA page
+    const imageMatches = html.match(/https:\/\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/gi) || [];
+    const psaImages = imageMatches.filter(url => 
+      url.includes('psacard') || url.includes('cert') || url.includes('card')
+    );
+    
+    // Extract card info
+    const gradeMatch = html.match(/Grade[:\s]*<[^>]*>([^<]+)/i);
+    const nameMatch = html.match(/Card\s*Name[:\s]*<[^>]*>([^<]+)/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+    const yearMatch = html.match(/Year[:\s]*<[^>]*>(\d{4})/i);
+    
+    return {
+      certNumber,
+      psaUrl,
+      grade: gradeMatch ? gradeMatch[1].trim() : null,
+      cardName: nameMatch ? nameMatch[1].trim() : null,
+      year: yearMatch ? yearMatch[1] : null,
+      referenceImages: psaImages.slice(0, 5), // Max 5 images
+      found: true
+    };
+    
+  } catch (error) {
+    console.error('[PSA Scraper] Error:', error.message);
+    return { error: error.message, psaUrl };
+  }
+}
+
+/**
+ * Download and load reference image for comparison
+ */
+async function loadReferenceImage(imageUrl) {
+  try {
+    const response = await fetch(imageUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    
+    if (!response.ok) return null;
+    
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const image = sharp(buffer);
+    const metadata = await image.metadata();
+    
+    // Resize to standard size for comparison
+    const { data, info } = await image
+      .resize(900, 1200, { fit: 'contain', background: { r: 255, g: 255, b: 255 } })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    
+    return {
+      data: new Uint8ClampedArray(data),
+      width: info.width,
+      height: info.height,
+      originalWidth: metadata.width,
+      originalHeight: metadata.height
+    };
+  } catch (error) {
+    console.error('[Reference Image] Error loading:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Calculate color histogram correlation (like Manus code)
+ */
+function calculateHistogramCorrelation(imgData1, imgData2, width, height) {
+  // Build 8x8x8 color histograms (simplified)
+  const bins = 8;
+  const hist1 = new Float32Array(bins * bins * bins);
+  const hist2 = new Float32Array(bins * bins * bins);
+  
+  const pixelCount = width * height;
+  
+  for (let i = 0; i < pixelCount; i++) {
+    const idx = i * 4;
+    
+    // Image 1
+    const r1 = Math.floor(imgData1[idx] / 32);
+    const g1 = Math.floor(imgData1[idx + 1] / 32);
+    const b1 = Math.floor(imgData1[idx + 2] / 32);
+    hist1[r1 * 64 + g1 * 8 + b1]++;
+    
+    // Image 2
+    const r2 = Math.floor(imgData2[idx] / 32);
+    const g2 = Math.floor(imgData2[idx + 1] / 32);
+    const b2 = Math.floor(imgData2[idx + 2] / 32);
+    hist2[r2 * 64 + g2 * 8 + b2]++;
+  }
+  
+  // Normalize
+  for (let i = 0; i < hist1.length; i++) {
+    hist1[i] /= pixelCount;
+    hist2[i] /= pixelCount;
+  }
+  
+  // Calculate correlation
+  let sum1 = 0, sum2 = 0, sum12 = 0;
+  let sqSum1 = 0, sqSum2 = 0;
+  
+  const mean1 = hist1.reduce((a, b) => a + b, 0) / hist1.length;
+  const mean2 = hist2.reduce((a, b) => a + b, 0) / hist2.length;
+  
+  for (let i = 0; i < hist1.length; i++) {
+    const d1 = hist1[i] - mean1;
+    const d2 = hist2[i] - mean2;
+    sum12 += d1 * d2;
+    sqSum1 += d1 * d1;
+    sqSum2 += d2 * d2;
+  }
+  
+  const correlation = sum12 / (Math.sqrt(sqSum1) * Math.sqrt(sqSum2) || 1);
+  return Math.max(0, Math.min(1, correlation));
+}
+
+/**
+ * Calculate Laplacian sharpness variance (like Manus code)
+ */
+function calculateSharpness(imgData, width, height) {
+  const gray = rgbToGrayscale(imgData, width, height);
+  
+  // Laplacian kernel
+  const kernel = [0, 1, 0, 1, -4, 1, 0, 1, 0];
+  
+  let sum = 0;
+  let sumSq = 0;
+  let count = 0;
+  
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let laplacian = 0;
+      
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          const idx = (y + ky) * width + (x + kx);
+          laplacian += gray[idx] * kernel[(ky + 1) * 3 + (kx + 1)];
+        }
+      }
+      
+      sum += laplacian;
+      sumSq += laplacian * laplacian;
+      count++;
+    }
+  }
+  
+  const mean = sum / count;
+  const variance = (sumSq / count) - (mean * mean);
+  
+  return Math.abs(variance);
+}
+
+/**
+ * Simple SSIM (Structural Similarity) calculation
+ */
+function calculateSSIM(imgData1, imgData2, width, height) {
+  const gray1 = rgbToGrayscale(imgData1, width, height);
+  const gray2 = rgbToGrayscale(imgData2, width, height);
+  
+  const n = width * height;
+  
+  // Calculate means
+  let mean1 = 0, mean2 = 0;
+  for (let i = 0; i < n; i++) {
+    mean1 += gray1[i];
+    mean2 += gray2[i];
+  }
+  mean1 /= n;
+  mean2 /= n;
+  
+  // Calculate variances and covariance
+  let var1 = 0, var2 = 0, covar = 0;
+  for (let i = 0; i < n; i++) {
+    const d1 = gray1[i] - mean1;
+    const d2 = gray2[i] - mean2;
+    var1 += d1 * d1;
+    var2 += d2 * d2;
+    covar += d1 * d2;
+  }
+  var1 /= n;
+  var2 /= n;
+  covar /= n;
+  
+  // SSIM constants
+  const C1 = 6.5025;  // (0.01 * 255)^2
+  const C2 = 58.5225; // (0.03 * 255)^2
+  
+  const ssim = ((2 * mean1 * mean2 + C1) * (2 * covar + C2)) /
+               ((mean1 * mean1 + mean2 * mean2 + C1) * (var1 + var2 + C2));
+  
+  return Math.max(0, Math.min(1, ssim));
+}
+
+/**
+ * PSA Reference Comparison Endpoint
+ * Compares user's image against PSA reference images
+ */
+app.post('/api/psa-compare', async (req, res) => {
+  try {
+    const { userImage, certNumber } = req.body;
+    
+    if (!userImage || !certNumber) {
+      return res.status(400).json({ error: 'Missing userImage or certNumber' });
+    }
+    
+    console.log(`[PSA Compare] Starting comparison for cert #${certNumber}`);
+    const startTime = Date.now();
+    
+    // Load user image
+    console.log('[PSA Compare] Loading user image...');
+    const userImgData = await loadImageData(userImage);
+    
+    // Resize user image to standard size
+    const userBuffer = Buffer.from(userImage.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+    const userResized = await sharp(userBuffer)
+      .resize(900, 1200, { fit: 'contain', background: { r: 255, g: 255, b: 255 } })
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    
+    const userStandardized = {
+      data: new Uint8ClampedArray(userResized.data),
+      width: userResized.info.width,
+      height: userResized.info.height
+    };
+    
+    // Fetch PSA reference
+    console.log('[PSA Compare] Fetching PSA reference...');
+    const psaRef = await fetchPSAReference(certNumber);
+    
+    if (psaRef.error === 'cloudflare_blocked') {
+      return res.json({
+        success: false,
+        error: 'cloudflare_blocked',
+        message: 'PSA website is protected by Cloudflare. Manual verification required.',
+        psaUrl: psaRef.psaUrl,
+        userAnalysis: {
+          sharpness: calculateSharpness(userStandardized.data, userStandardized.width, userStandardized.height)
+        }
+      });
+    }
+    
+    // If we got PSA images, compare them
+    const comparisonResults = [];
+    
+    if (psaRef.referenceImages && psaRef.referenceImages.length > 0) {
+      console.log(`[PSA Compare] Found ${psaRef.referenceImages.length} reference images`);
+      
+      for (const refUrl of psaRef.referenceImages.slice(0, 3)) { // Compare with max 3 refs
+        const refImg = await loadReferenceImage(refUrl);
+        if (!refImg) continue;
+        
+        // Calculate comparison metrics
+        const colorCorrelation = calculateHistogramCorrelation(
+          userStandardized.data, refImg.data, 
+          userStandardized.width, userStandardized.height
+        );
+        
+        const ssim = calculateSSIM(
+          userStandardized.data, refImg.data,
+          userStandardized.width, userStandardized.height
+        );
+        
+        const userSharpness = calculateSharpness(userStandardized.data, userStandardized.width, userStandardized.height);
+        const refSharpness = calculateSharpness(refImg.data, refImg.width, refImg.height);
+        const sharpnessDiff = Math.abs(userSharpness - refSharpness);
+        
+        comparisonResults.push({
+          referenceUrl: refUrl,
+          colorCorrelation: colorCorrelation.toFixed(4),
+          ssim: ssim.toFixed(4),
+          userSharpness: userSharpness.toFixed(2),
+          refSharpness: refSharpness.toFixed(2),
+          sharpnessDifference: sharpnessDiff.toFixed(2)
+        });
+      }
+    }
+    
+    // Calculate final authenticity score (like Manus code)
+    let score = 100;
+    const warnings = [];
+    
+    if (comparisonResults.length > 0) {
+      const avgColorCorr = comparisonResults.reduce((a, r) => a + parseFloat(r.colorCorrelation), 0) / comparisonResults.length;
+      const avgSSIM = comparisonResults.reduce((a, r) => a + parseFloat(r.ssim), 0) / comparisonResults.length;
+      const avgSharpDiff = comparisonResults.reduce((a, r) => a + parseFloat(r.sharpnessDifference), 0) / comparisonResults.length;
+      
+      // Scoring (matching Manus logic)
+      if (avgColorCorr < 0.7) {
+        score -= 25;
+        warnings.push(`Low color correlation: ${(avgColorCorr * 100).toFixed(1)}%`);
+      }
+      
+      if (avgSSIM < 0.6) {
+        score -= 25;
+        warnings.push(`Low structural similarity: ${(avgSSIM * 100).toFixed(1)}%`);
+      }
+      
+      if (avgSharpDiff > 100) {
+        score -= 20;
+        warnings.push(`Significant sharpness difference: ${avgSharpDiff.toFixed(0)}`);
+      }
+    } else {
+      // No reference images - can't compare
+      score = 50;
+      warnings.push('No PSA reference images available for comparison');
+    }
+    
+    // Determine verdict
+    let verdict;
+    if (score < 50) {
+      verdict = 'LIKELY_FAKE';
+    } else if (score < 75) {
+      verdict = 'SUSPICIOUS';
+    } else {
+      verdict = 'LIKELY_AUTHENTIC';
+    }
+    
+    const processingTime = Date.now() - startTime;
+    
+    console.log(`[PSA Compare] Complete in ${processingTime}ms - Score: ${score}/100 - ${verdict}`);
+    
+    res.json({
+      success: true,
+      certNumber,
+      psaData: {
+        grade: psaRef.grade,
+        cardName: psaRef.cardName,
+        year: psaRef.year,
+        psaUrl: psaRef.psaUrl
+      },
+      comparison: {
+        referenceImagesFound: comparisonResults.length,
+        results: comparisonResults
+      },
+      authenticity: {
+        score,
+        verdict,
+        warnings
+      },
+      processingTime: `${processingTime}ms`
+    });
+    
+  } catch (error) {
+    console.error('[PSA Compare] Error:', error);
+    res.status(500).json({
+      error: 'PSA comparison failed',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * Known PSA Certs with cached reference data
+ */
+const KNOWN_PSA_CERTS = {
+  '63437557': {
+    grade: '10',
+    cardName: 'Lugia Holo 1st Edition',
+    set: 'Neo Genesis',
+    year: '2000',
+    // Real PSA reference images (from psacard.com or cached)
+    referenceImages: []
+  }
+};
+
+/**
+ * Get PSA reference data (cached or scraped)
+ */
+app.get('/api/psa-reference/:certNumber', async (req, res) => {
+  const certNumber = req.params.certNumber.replace(/[^0-9]/g, '');
+  
+  // Check cache first
+  if (KNOWN_PSA_CERTS[certNumber]) {
+    return res.json({
+      ...KNOWN_PSA_CERTS[certNumber],
+      certNumber,
+      cached: true,
+      psaUrl: `https://www.psacard.com/cert/${certNumber}`
+    });
+  }
+  
+  // Scrape PSA
+  const psaRef = await fetchPSAReference(certNumber);
+  res.json(psaRef);
+});
+
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 TCG-Forensics CV Backend running on port ${PORT}`);
   console.log(`📊 Available algorithms: 8 PRO tier`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🎯 CV endpoint: POST http://localhost:${PORT}/api/cv\n`);
+  console.log(`🎯 CV endpoint: POST http://localhost:${PORT}/api/cv`);
+  console.log(`🔍 PSA Compare: POST http://localhost:${PORT}/api/psa-compare\n`);
 });
